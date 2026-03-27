@@ -134,7 +134,9 @@ If hash data exists, prebuilt files are verified before use.
 
 ```bash
 python -m lxbinman healthcheck --source-dir core/engines
+python -m lxbinman healthcheck --source-dir core/engines --json
 python -m lxbinman build --source-dir core/engines --policy prefer_prebuilt
+python -m lxbinman build --source-dir core/engines --policy prefer_prebuilt --json
 python -m lxbinman fast-build --source-dir core/engines --output-dir core/engines
 python -m lxbinman toolchain --source-dir core/engines
 python -m lxbinman prune --source-dir core/engines
@@ -142,3 +144,12 @@ python -m lxbinman clean --source-dir core/engines --dry-run
 python -m lxbinman clean --source-dir core/engines --profile release
 python -m lxbinman clean --source-dir core/engines --mode deep --pycache --build-artifacts
 ```
+
+Notes:
+- `build` returns non-zero (`2`) when at least one engine failed.
+- `--policy` is validated (`prefer_prebuilt|prefer_cache|build_only|prebuilt_only`).
+- `--json` is available for all CLI subcommands to simplify automation.
+
+## Compatibility Layers
+
+`moduleapi` and `binman` remain available for backward compatibility, but new integrations should import from `lxbinman` directly.

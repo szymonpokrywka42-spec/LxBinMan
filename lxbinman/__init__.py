@@ -1,7 +1,5 @@
 from .autobin import AutoBinError, LoadPolicy, healthcheck, load, load_many, runtime_info
-from .feedback import FeedbackBus, FeedbackEvent
-
-feedback = FeedbackBus()
+from .feedback import FeedbackBus, FeedbackEvent, feedback
 
 from . import builder
 from .builder import CLEAN_PROFILES

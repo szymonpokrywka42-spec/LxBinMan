@@ -23,6 +23,24 @@ class FeedbackBus:
         self._console_enabled = True
         self._file_path: Path | None = None
         self._file_handle: TextIO | None = None
+        self._kill_on_error = False
+        self._init_default_sink()
+
+    def _default_log_path(self) -> Path:
+        here = Path(__file__).resolve()
+        for parent in [here.parent] + list(here.parent.parents):
+            if (parent / "assets").exists():
+                return parent / "assets" / "logs" / "lxbinman.log"
+            if (parent / "pyproject.toml").exists():
+                return parent / "assets" / "logs" / "lxbinman.log"
+        return here.parent / ".binman" / "logs" / "lxbinman.log"
+
+    def _init_default_sink(self) -> None:
+        try:
+            self.set_file_sink(str(self._default_log_path()))
+        except Exception:
+            # Best-effort; console logging will still work.
+            pass
 
     def subscribe(self, callback: Callable[[FeedbackEvent], None]) -> None:
         self._subscribers.append(callback)
@@ -35,6 +53,9 @@ class FeedbackBus:
 
     def enable_console(self, enabled: bool = True) -> None:
         self._console_enabled = bool(enabled)
+
+    def set_kill_on_error(self, enabled: bool = True) -> None:
+        self._kill_on_error = bool(enabled)
 
     def set_file_sink(self, file_path: str) -> None:
         path = Path(file_path)
@@ -84,7 +105,10 @@ class FeedbackBus:
         return self.emit("WARNING", code, message, **context)
 
     def error(self, code: str, message: str, **context: Any) -> FeedbackEvent:
-        return self.emit("ERROR", code, message, **context)
+        evt = self.emit("ERROR", code, message, **context)
+        if self._kill_on_error:
+            raise RuntimeError(f"{code}: {message}")
+        return evt
 
     def history(self) -> list[FeedbackEvent]:
         return list(self._history)
@@ -101,3 +125,6 @@ class FeedbackBus:
             ctx = ", ".join(f"{k}={v}" for k, v in event.context.items())
             return f"{event.timestamp} [{event.level}] {event.code}: {event.message} | {ctx}"
         return f"{event.timestamp} [{event.level}] {event.code}: {event.message}"
+
+
+feedback = FeedbackBus()

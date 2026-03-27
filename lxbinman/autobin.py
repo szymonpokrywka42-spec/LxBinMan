@@ -12,6 +12,8 @@ import sysconfig
 from pathlib import Path
 from typing import Callable, Literal
 
+from .error_trap import install_error_trap
+
 from .manifest import cache_key as _cache_key
 from .manifest import is_manifest_compatible, read_manifest, runtime_info
 
@@ -26,6 +28,20 @@ Logger = Callable[[str, str], None]
 
 def _default_log(level: str, message: str) -> None:
     print(f"[{level}] {message}")
+
+
+# install fatal trap on import (unless embedded)
+_ENABLE_FATAL = os.getenv("LXBINMAN_ENABLE_FATAL", "").strip().lower() in {"1", "true", "yes", "on"}
+if _ENABLE_FATAL:
+    install_error_trap()
+
+_VALID_POLICIES: tuple[LoadPolicy, ...] = (
+    "prefer_prebuilt",
+    "prefer_cache",
+    "build_only",
+    "prebuilt_only",
+)
+_BUILD_TIMEOUT_SECONDS = 300.0
 
 
 def _ext_suffix() -> str:
@@ -64,7 +80,10 @@ def _default_prebuilt_root(source_dir: Path) -> Path:
 
 def _pybind11_includes(log: Logger) -> list[str]:
     cmd = [sys.executable or "python3", "-m", "pybind11", "--includes"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20.0)
+    except subprocess.TimeoutExpired as e:
+        raise AutoBinError("pybind11 include detection timed out") from e
     if result.returncode != 0:
         raise AutoBinError(
             f"pybind11 include detection failed: {(result.stderr or '').strip()}"
@@ -216,7 +235,12 @@ def _build_module(
         cmd.extend(extra_link_args)
 
     log("ENGINE", f"Compiling {engine_name} with {compiler}...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_BUILD_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as e:
+        if tmp_so.exists():
+            tmp_so.unlink(missing_ok=True)
+        raise AutoBinError(f"Build timeout for '{engine_name}' after {_BUILD_TIMEOUT_SECONDS:.0f}s") from e
     if result.returncode != 0:
         if tmp_so.exists():
             tmp_so.unlink(missing_ok=True)
@@ -292,67 +316,139 @@ def load(
     - build_only: build only
     - prebuilt_only: prebuilt only (no build)
     """
-    logger = log or _default_log
-    src_dir = Path(source_dir).resolve()
-    if not src_dir.exists():
-        raise AutoBinError(f"source_dir not found: {src_dir}")
+    try:
+        logger = log or _default_log
+        if policy not in _VALID_POLICIES:
+            raise AutoBinError(f"Invalid load policy: {policy}")
+        src_dir = Path(source_dir).resolve()
+        if not src_dir.exists():
+            raise AutoBinError(f"source_dir not found: {src_dir}")
 
-    cpp_path = src_dir / f"{engine_name}.cpp"
-    if not cpp_path.exists():
-        raise AutoBinError(f"source file not found: {cpp_path}")
+        cpp_path = src_dir / f"{engine_name}.cpp"
+        if not cpp_path.exists():
+            raise AutoBinError(f"source file not found: {cpp_path}")
 
-    suffix = ".so" if output_dir else _ext_suffix()
-    key = _cache_key()
+        suffix = _ext_suffix()
+        key = _cache_key()
 
-    pre_root = Path(prebuilt_root).resolve() if prebuilt_root else _default_prebuilt_root(src_dir)
-    cache_base = Path(cache_root).resolve() if cache_root else _default_cache_root(src_dir)
+        pre_root = Path(prebuilt_root).resolve() if prebuilt_root else _default_prebuilt_root(src_dir)
+        cache_base = Path(cache_root).resolve() if cache_root else _default_cache_root(src_dir)
 
-    cache_dir = cache_base / key
-    cache_so = cache_dir / f"{engine_name}{_ext_suffix()}"
-    target_dir = Path(output_dir).resolve() if output_dir else cache_dir
-    target_so = target_dir / f"{engine_name}{suffix}"
+        cache_dir = cache_base / key
+        cache_so = cache_dir / f"{engine_name}{_ext_suffix()}"
+        target_dir = Path(output_dir).resolve() if output_dir else cache_dir
+        target_so = target_dir / f"{engine_name}{suffix}"
 
-    logger("INFO", f"autobin.load('{engine_name}') key={key} policy={policy}")
+        logger("INFO", f"autobin.load('{engine_name}') key={key} policy={policy}")
 
-    prebuilt_key_dir = pre_root / key
-    prebuilt_key_so = prebuilt_key_dir / f"{engine_name}{suffix}"
-    prebuilt_plain_so = pre_root / f"{engine_name}{suffix}"
-    abi_guard_enabled = bool(output_dir)
-    signature = _build_signature(
-        cpp_path,
-        compiler=compiler,
-        cxx_std=cxx_std,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-    )
+        prebuilt_key_dir = pre_root / key
+        prebuilt_key_so = prebuilt_key_dir / f"{engine_name}{suffix}"
+        prebuilt_plain_so = pre_root / f"{engine_name}{suffix}"
+        abi_guard_enabled = bool(output_dir)
+        signature = _build_signature(
+            cpp_path,
+            compiler=compiler,
+            cxx_std=cxx_std,
+            extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args,
+        )
 
-    def try_prebuilt() -> bool:
-        ok_key, manifest_key = _manifest_ok(prebuilt_key_dir, logger)
-        if ok_key and _copy_if_fresh_verified(prebuilt_key_so, target_so, cpp_path, manifest_key, logger):
-            if abi_guard_enabled:
-                _write_abi_sidecar(target_so, build_signature=signature)
+        def try_prebuilt() -> bool:
+            ok_key, manifest_key = _manifest_ok(prebuilt_key_dir, logger)
+            if ok_key and _copy_if_fresh_verified(prebuilt_key_so, target_so, cpp_path, manifest_key, logger):
+                if abi_guard_enabled:
+                    _write_abi_sidecar(target_so, build_signature=signature)
+                return True
+
+            ok_plain, manifest_plain = _manifest_ok(pre_root, logger)
+            if ok_plain and _copy_if_fresh_verified(prebuilt_plain_so, target_so, cpp_path, manifest_plain, logger):
+                if abi_guard_enabled:
+                    _write_abi_sidecar(target_so, build_signature=signature)
+                return True
+
+            return False
+
+        def try_cache() -> bool:
+            if not target_so.exists():
+                return False
+            if target_so.stat().st_mtime < cpp_path.stat().st_mtime:
+                return False
+            if abi_guard_enabled and not _is_abi_compatible(target_so, expected_signature=signature):
+                logger("WARN", f"ABI guard: stale local binary for {engine_name}, forcing rebuild")
+                return False
             return True
 
-        ok_plain, manifest_plain = _manifest_ok(pre_root, logger)
-        if ok_plain and _copy_if_fresh_verified(prebuilt_plain_so, target_so, cpp_path, manifest_plain, logger):
+        build_status = "up_to_date"
+        if policy == "build_only":
+            _build_module(
+                engine_name,
+                cpp_path,
+                target_so,
+                compiler=compiler,
+                cxx_std=cxx_std,
+                extra_compile_args=extra_compile_args,
+                extra_link_args=extra_link_args,
+                log=logger,
+            )
             if abi_guard_enabled:
                 _write_abi_sidecar(target_so, build_signature=signature)
-            return True
+                if save_prebuilt:
+                    _backup_prebuilt(
+                        target_so=target_so,
+                        target_sidecar=_abi_sidecar_path(target_so),
+                        prebuilt_so=prebuilt_key_so,
+                        log=logger,
+                    )
+            build_status = "rebuilt"
+            if compile_only:
+                return {"ok": True, "path": str(target_so), "status": build_status}
+            return _import_module_from_path(engine_name, target_so)
 
-        return False
+        if policy == "prebuilt_only":
+            if not try_prebuilt():
+                raise AutoBinError(f"prebuilt_only: no compatible prebuilt for '{engine_name}'")
+            build_status = "restored"
+            if compile_only:
+                return {"ok": True, "path": str(target_so), "status": build_status}
+            return _import_module_from_path(engine_name, target_so)
 
-    def try_cache() -> bool:
-        if not target_so.exists():
-            return False
-        if target_so.stat().st_mtime < cpp_path.stat().st_mtime:
-            return False
-        if abi_guard_enabled and not _is_abi_compatible(target_so, expected_signature=signature):
-            logger("WARN", f"ABI guard: stale local binary for {engine_name}, forcing rebuild")
-            return False
-        return True
+        if policy == "prefer_cache":
+            if try_cache():
+                logger("INFO", f"Using ABI cache for {engine_name}")
+                if abi_guard_enabled and save_prebuilt:
+                    _backup_prebuilt(
+                        target_so=target_so,
+                        target_sidecar=_abi_sidecar_path(target_so),
+                        prebuilt_so=prebuilt_key_so,
+                        log=logger,
+                    )
+                if compile_only:
+                    return {"ok": True, "path": str(target_so), "status": build_status}
+                return _import_module_from_path(engine_name, target_so)
+            if try_prebuilt():
+                build_status = "restored"
+                if compile_only:
+                    return {"ok": True, "path": str(target_so), "status": build_status}
+                return _import_module_from_path(engine_name, target_so)
+        else:  # prefer_prebuilt
+            if try_prebuilt():
+                build_status = "restored"
+                if compile_only:
+                    return {"ok": True, "path": str(target_so), "status": build_status}
+                return _import_module_from_path(engine_name, target_so)
+            if try_cache():
+                logger("INFO", f"Using ABI cache for {engine_name}")
+                if abi_guard_enabled and save_prebuilt:
+                    _backup_prebuilt(
+                        target_so=target_so,
+                        target_sidecar=_abi_sidecar_path(target_so),
+                        prebuilt_so=prebuilt_key_so,
+                        log=logger,
+                    )
+                if compile_only:
+                    return {"ok": True, "path": str(target_so), "status": build_status}
+                return _import_module_from_path(engine_name, target_so)
 
-    build_status = "up_to_date"
-    if policy == "build_only":
         _build_module(
             engine_name,
             cpp_path,
@@ -376,75 +472,10 @@ def load(
         if compile_only:
             return {"ok": True, "path": str(target_so), "status": build_status}
         return _import_module_from_path(engine_name, target_so)
-
-    if policy == "prebuilt_only":
-        if not try_prebuilt():
-            raise AutoBinError(f"prebuilt_only: no compatible prebuilt for '{engine_name}'")
-        build_status = "restored"
-        if compile_only:
-            return {"ok": True, "path": str(target_so), "status": build_status}
-        return _import_module_from_path(engine_name, target_so)
-
-    if policy == "prefer_cache":
-        if try_cache():
-            logger("INFO", f"Using ABI cache for {engine_name}")
-            if abi_guard_enabled and save_prebuilt:
-                _backup_prebuilt(
-                    target_so=target_so,
-                    target_sidecar=_abi_sidecar_path(target_so),
-                    prebuilt_so=prebuilt_key_so,
-                    log=logger,
-                )
-            if compile_only:
-                return {"ok": True, "path": str(target_so), "status": build_status}
-            return _import_module_from_path(engine_name, target_so)
-        if try_prebuilt():
-            build_status = "restored"
-            if compile_only:
-                return {"ok": True, "path": str(target_so), "status": build_status}
-            return _import_module_from_path(engine_name, target_so)
-    else:  # prefer_prebuilt
-        if try_prebuilt():
-            build_status = "restored"
-            if compile_only:
-                return {"ok": True, "path": str(target_so), "status": build_status}
-            return _import_module_from_path(engine_name, target_so)
-        if try_cache():
-            logger("INFO", f"Using ABI cache for {engine_name}")
-            if abi_guard_enabled and save_prebuilt:
-                _backup_prebuilt(
-                    target_so=target_so,
-                    target_sidecar=_abi_sidecar_path(target_so),
-                    prebuilt_so=prebuilt_key_so,
-                    log=logger,
-                )
-            if compile_only:
-                return {"ok": True, "path": str(target_so), "status": build_status}
-            return _import_module_from_path(engine_name, target_so)
-
-    _build_module(
-        engine_name,
-        cpp_path,
-        target_so,
-        compiler=compiler,
-        cxx_std=cxx_std,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-        log=logger,
-    )
-    if abi_guard_enabled:
-        _write_abi_sidecar(target_so, build_signature=signature)
-        if save_prebuilt:
-            _backup_prebuilt(
-                target_so=target_so,
-                target_sidecar=_abi_sidecar_path(target_so),
-                prebuilt_so=prebuilt_key_so,
-                log=logger,
-            )
-    build_status = "rebuilt"
-    if compile_only:
-        return {"ok": True, "path": str(target_so), "status": build_status}
-    return _import_module_from_path(engine_name, target_so)
+    except Exception as exc:  # noqa: PERF203
+        if isinstance(exc, AutoBinError):
+            raise
+        raise AutoBinError(str(exc)) from exc
 
 
 def load_many(
@@ -463,24 +494,29 @@ def load_many(
     policy: LoadPolicy = "prefer_prebuilt",
     log: Logger | None = None,
 ) -> dict[str, object]:
-    out: dict[str, object] = {}
-    for name in engine_names:
-        out[name] = load(
-            name,
-            source_dir=source_dir,
-            prebuilt_root=prebuilt_root,
-            cache_root=cache_root,
-            output_dir=output_dir,
-            compiler=compiler,
-            cxx_std=cxx_std,
-            extra_compile_args=extra_compile_args,
-            extra_link_args=extra_link_args,
-            compile_only=compile_only,
-            save_prebuilt=save_prebuilt,
-            policy=policy,
-            log=log,
-        )
-    return out
+    try:
+        out: dict[str, object] = {}
+        for name in engine_names:
+            out[name] = load(
+                name,
+                source_dir=source_dir,
+                prebuilt_root=prebuilt_root,
+                cache_root=cache_root,
+                output_dir=output_dir,
+                compiler=compiler,
+                cxx_std=cxx_std,
+                extra_compile_args=extra_compile_args,
+                extra_link_args=extra_link_args,
+                compile_only=compile_only,
+                save_prebuilt=save_prebuilt,
+                policy=policy,
+                log=log,
+            )
+        return out
+    except Exception as exc:  # noqa: PERF203
+        if isinstance(exc, AutoBinError):
+            raise
+        raise AutoBinError(str(exc)) from exc
 
 
 def healthcheck(
@@ -511,7 +547,7 @@ def healthcheck(
     pybind_ok = False
     pybind_err = ""
     try:
-        result = subprocess.run([py, "-m", "pybind11", "--includes"], capture_output=True, text=True)
+        result = subprocess.run([py, "-m", "pybind11", "--includes"], capture_output=True, text=True, timeout=20.0)
         pybind_ok = result.returncode == 0
         if not pybind_ok:
             pybind_err = (result.stderr or result.stdout or "").strip()

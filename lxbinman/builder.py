@@ -298,7 +298,14 @@ def run_script_all(
     if names is None:
         scripts = discover_scripts(src, extensions=extensions)
     else:
-        scripts = [str((src / name).resolve()) for name in names]
+        scripts = []
+        for name in names:
+            candidate = (src / name).resolve()
+            try:
+                candidate.relative_to(src)
+            except ValueError as e:
+                raise BuilderError(f"script path escapes source_dir: {name}") from e
+            scripts.append(str(candidate))
 
     if not scripts:
         fb.info("script:empty", "No script duties found", source_dir=str(src))
@@ -411,12 +418,15 @@ def build_all(
     policy: autobin.LoadPolicy = "prefer_prebuilt",
     engine_config: EngineConfig | None = None,
     config_path: str | Path | None = None,
+    return_report: bool = False,
 ) -> dict[str, object]:
     fb = _resolve_feedback(feedback)
     src = Path(source_dir).resolve()
     engines = list(names) if names is not None else discover_engines(src)
     if not engines:
         fb.warning("builder:empty", "No C++ engines found", source_dir=str(src))
+        if return_report:
+            return {"ok": {}, "failed": []}
         return {}
 
     cfg = engine_config if engine_config is not None else load_engine_config(source_dir=src, config_path=config_path, feedback=fb)
@@ -450,6 +460,8 @@ def build_all(
         fb.warning("builder:partial", "Some engines failed", failed=",".join(failed))
     else:
         fb.success("builder:done", "All engines ready", count=len(result))
+    if return_report:
+        return {"ok": result, "failed": failed}
     return result
 
 
